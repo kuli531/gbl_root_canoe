@@ -1,5 +1,5 @@
 Build environment: Linux-6.17.0-14-generic-x86_64-with-glibc2.42
-Build start time: 23:08:59, Mar.24 2026
+Build start time: 12:30:20, Mar.25 2026
 
 WORKSPACE        = /home/wyb/gbl_root_canoe/edk2
 EDK_TOOLS_PATH   = /home/wyb/gbl_root_canoe/edk2/BaseTools
@@ -1337,9 +1337,9 @@ GUID cross reference file can be found at /home/wyb/gbl_root_canoe/edk2/Build/RE
 
 FV Space Information
 FVMAIN [99%Full] 196800 total, 196784 used, 16 free
-FVMAIN_COMPACT [16%Full] 249856 total, 41920 used, 207936 free
+FVMAIN_COMPACT [16%Full] 249856 total, 41864 used, 207992 free
 
 - Done -
-Build end time: 23:09:11, Mar.24 2026
+Build end time: 12:30:32, Mar.25 2026
 Build total time: 00:00:12
 

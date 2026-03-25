@@ -1,0 +1,30 @@
+# macOS System Files
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Logs
+*.log
+logs/
+*.syslog
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+
+# ABL/GBL Binary & Build Assets
+*.elf
+*.bin
+*.img
+*.efi
+extracted/
+
+# VS Code
+.vscode/

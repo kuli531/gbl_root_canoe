@@ -1,382 +1,186 @@
 #!/usr/bin/env python3
-"""
-Extract LinuxLoader.efi from Qualcomm ABL.img
-Supports LZMA-compressed nested Firmware Volumes.
-"""
-
 import struct
 import sys
 import os
 import lzma
+import argparse
 
+# add unique code
 EFI_FV_SIGNATURE = b'_FVH'
+PE_MZ_SIGNATURE = b'MZ'
+BMP_SIGNATURE = b'BM'
 
-# Section Types
-EFI_SECTION_COMPRESSION           = 0x01
-EFI_SECTION_GUID_DEFINED          = 0x02
-EFI_SECTION_PE32                  = 0x10
-EFI_SECTION_TE                    = 0x12
-EFI_SECTION_USER_INTERFACE        = 0x15
-EFI_SECTION_FIRMWARE_VOLUME_IMAGE = 0x17
-EFI_SECTION_RAW                   = 0x19
+class HeavyExtractor:
+    def __init__(self, verbose=False, info_only=False):
+        self.pe_files = []
+        self.images = [] 
+        self.scanned_hashes = set()
+        self.verbose = verbose
+        self.info_only = info_only
 
-# Compression Types
-EFI_NOT_COMPRESSED    = 0x00
-EFI_STANDARD_COMPRESSION = 0x01
+    def log(self, msg, depth=0):
+        if self.verbose or self.info_only:
+            prefix = "  " * depth
+            print(f"{prefix}[*] {msg}")
 
-# Known LZMA GUID-defined section GUIDs
-LZMA_COMPRESS_GUID = 'ee4e5898-3914-4259-9d6e-dc7bd79403cf'
-
-FFS_TYPE_NAMES = {
-    0x01: 'RAW', 0x02: 'FREEFORM', 0x03: 'SECURITY_CORE',
-    0x04: 'PEI_CORE', 0x05: 'DXE_CORE', 0x06: 'PEIM',
-    0x07: 'DRIVER', 0x08: 'COMBINED_PEIM_DRIVER', 0x09: 'APPLICATION',
-    0x0A: 'MM', 0x0B: 'FV_IMAGE',
-}
-
-SECTION_TYPE_NAMES = {
-    0x01: 'COMPRESSION', 0x02: 'GUID_DEFINED', 0x10: 'PE32',
-    0x12: 'TE', 0x15: 'USER_INTERFACE', 0x17: 'FV_IMAGE', 0x19: 'RAW',
-}
-
-def read_guid(data, offset):
-    if offset + 16 > len(data):
-        return None
-    d1, d2, d3 = struct.unpack_from('<IHH', data, offset)
-    d4 = data[offset + 8:offset + 16]
-    return (f'{d1:08x}-{d2:04x}-{d3:04x}-'
-            f'{d4[0]:02x}{d4[1]:02x}-'
-            + ''.join(f'{b:02x}' for b in d4[2:8]))
-
-def align_up(offset, alignment):
-    return (offset + alignment - 1) & ~(alignment - 1)
-
-def get_section_size(data, offset):
-    if offset + 4 > len(data):
-        return 0, 4
-    s = data[offset] | (data[offset + 1] << 8) | (data[offset + 2] << 16)
-    if s == 0xFFFFFF:
-        if offset + 8 <= len(data):
-            return struct.unpack_from('<I', data, offset + 4)[0], 8
-        return 0, 4
-    return s, 4
-
-def get_ffs_size(data, offset):
-    if offset + 24 > len(data):
-        return 0, 24
-    attrs = data[offset + 19]
-    s = data[offset + 20] | (data[offset + 21] << 8) | (data[offset + 22] << 16)
-    if s == 0xFFFFFF and (attrs & 0x01):
-        if offset + 32 <= len(data):
-            return struct.unpack_from('<Q', data, offset + 24)[0], 32
-        return 0, 24
-    return s, 24
-
-def try_lzma_decompress(data):
-    """尝试多种方式解压 LZMA 数据"""
-    # 方式1: 标准 LZMA (5 byte props + 8 byte size + compressed)
-    if len(data) >= 13 and data[0] == 0x5D:
-        try:
-            decompressor = lzma.LZMADecompressor(format=lzma.FORMAT_ALONE)
-            result = decompressor.decompress(data)
-            return result
-        except lzma.LZMAError:
-            pass
-
-    # 方式2: raw LZMA stream with properties
-    if len(data) >= 5:
-        try:
-            # 构造 LZMA alone header
-            props = data[:5]  # 5 bytes: lc/lp/pb + dict size
-            # 尝试从后续字段读取 uncompressed size
-            if len(data) >= 13:
-                uncomp_size = struct.unpack_from('<Q', data, 5)[0]
-                header = props + struct.pack('<Q', uncomp_size)
-                compressed = data[13:]
-                decompressor = lzma.LZMADecompressor(format=lzma.FORMAT_ALONE)
-                result = decompressor.decompress(header + compressed)
-                return result
-        except (lzma.LZMAError, struct.error):
-            pass
-
-    # 方式3: EFI 风格 LZMA (直接 raw stream, props 在 GUID section 里)
-    for skip in [0, 5, 9, 13]:
-        if skip >= len(data):
-            continue
-        try:
-            decompressor = lzma.LZMADecompressor(format=lzma.FORMAT_ALONE)
-            result = decompressor.decompress(data[skip:])
-            return result
-        except lzma.LZMAError:
-            pass
-
-    # 方式4: xz
-    try:
-        return lzma.decompress(data)
-    except lzma.LZMAError:
-        pass
-
-    return None
-
-class EfiExtractor:
-    def __init__(self, data):
-        self.data = data
-        self.results = []  # (name, guid, pe_data)
-
-    def run(self):
-        print(f'文件大小: {len(self.data)} bytes (0x{len(self.data):X})\n')
-        self._scan_and_parse(self.data, 0, 0)
-
-    def _scan_and_parse(self, buf, base, depth):
-        """在 buf 中扫描 FV 并解析"""
-        off = 0
-        found = False
-        while off < len(buf) - 0x38:
-            pos = buf.find(EFI_FV_SIGNATURE, off)
-            if pos == -1:
-                break
-            fv_start = pos - 0x28
-            if fv_start < 0:
-                off = pos + 4
-                continue
+    def try_lzma_decompress(self, data):
+        data = bytes(data)
+        for skip in range(0, 32): 
+            if skip >= len(data): break
+            d = data[skip:]
+            if len(d) < 5 or d[0] != 0x5D: continue 
             try:
-                fv_length = struct.unpack_from('<Q', buf, fv_start + 0x20)[0]
-                sig = buf[fv_start + 0x28:fv_start + 0x2C]
-                hdr_len = struct.unpack_from('<H', buf, fv_start + 0x30)[0]
-                if (sig == EFI_FV_SIGNATURE
-                        and 0x48 <= hdr_len <= 0x200
-                        and 0 < fv_length <= len(buf) - fv_start):
-                    self._parse_fv(buf, fv_start, fv_length, hdr_len, depth)
-                    found = True
-            except struct.error:
-                pass
-            off = pos + 4
-        return found
+                header = d[:5] + struct.pack('<Q', 2**64 - 1)
+                return lzma.LZMADecompressor(format=lzma.FORMAT_ALONE).decompress(header + d[5:])
+            except:
+                try: return lzma.decompress(d)
+                except: continue
+        return None
 
-    def _parse_fv(self, buf, fv_start, fv_length, fv_hdr_len, depth):
-        prefix = '  ' * depth
-        print(f'{prefix}[FV] @ 0x{fv_start:08X}  size=0x{fv_length:X}')
+    def parse_pe_info(self, data, offset):
+        try:
+            pe_ptr = struct.unpack_from('<H', data, 0x3C)[0]
+            machine = struct.unpack_from('<H', data, pe_ptr + 4)[0]
+            subsystem = struct.unpack_from('<H', data, pe_ptr + 0x5C)[0]
+            
+            m_map = {0xAA64: "ARM64", 0x014C: "x86", 0x8664: "x64", 0x01C0: "ARM"}
+            s_map = {10: "EFI_APP", 11: "EFI_DRIVER", 12: "EFI_RUNTIME"}
+            
+            m_str = m_map.get(machine, f"0x{machine:X}")
+            s_str = s_map.get(subsystem, f"0x{subsystem:X}")
+            return f"Arch: {m_str}, Type: {s_str}"
+        except:
+            return "Unknown PE structure"
 
-        offset = align_up(fv_start + fv_hdr_len, 8)
-        fv_end = fv_start + fv_length
-
-        while offset + 24 <= fv_end:
-            if all(b == 0xFF for b in buf[offset:offset + 24]):
-                offset += 8
-                continue
-
-            guid = read_guid(buf, offset)
-            if guid is None:
-                break
-
-            ffs_size, ffs_hdr = get_ffs_size(buf, offset)
-            ffs_type = buf[offset + 18]
-
-            if ffs_size < ffs_hdr or offset + ffs_size > fv_end:
-                break
-
-            type_name = FFS_TYPE_NAMES.get(ffs_type, f'0x{ffs_type:02X}')
-
-            # 解析 sections
-            sections = self._parse_sections(buf, offset + ffs_hdr, offset + ffs_size, depth + 1)
-            name = self._get_ui_name(buf, sections)
-            name_str = f"  name='{name}'" if name else ''
-            print(f'{prefix}  [FFS] {guid}  {type_name}{name_str}')
-
-            # 提取 PE32
-            pe = self._get_pe32(buf, sections)
-            if pe:
-                self.results.append((name, guid, pe))
-                if name:
-                    print(f'{prefix}    -> PE32 ({len(pe)} bytes)')
-
-            offset = align_up(offset + ffs_size, 8)
-
-    def _parse_sections(self, buf, start, end, depth):
-        """递归解析 sections"""
-        sections = []
-        offset = start
-
-        while offset + 4 <= end:
-            offset = align_up(offset, 4)
-            if offset + 4 > end:
-                break
-
-            sec_size, sec_hdr = get_section_size(buf, offset)
-            if sec_size < sec_hdr or sec_size == 0 or offset + sec_size > end:
-                break
-
-            sec_type = buf[offset + 3]
-            sec = {
-                'type': sec_type,
-                'offset': offset,
-                'size': sec_size,
-                'hdr_size': sec_hdr,
-            }
-            sections.append(sec)
-
-            type_name = SECTION_TYPE_NAMES.get(sec_type, f'0x{sec_type:02X}')
-            prefix = '  ' * depth
-
-            if sec_type == EFI_SECTION_COMPRESSION:
-                self._handle_compression_section(buf, sec, sections, depth)
-
-            elif sec_type == EFI_SECTION_GUID_DEFINED:
-                self._handle_guid_defined_section(buf, sec, sections, depth)
-
-            elif sec_type == EFI_SECTION_FIRMWARE_VOLUME_IMAGE:
-                # 内容是一个完整的 FV
-                data_off = offset + sec_hdr
-                data_size = sec_size - sec_hdr
-                fv_data = buf[data_off:data_off + data_size]
-                self._scan_and_parse(fv_data, 0, depth + 1)
-
-            offset += sec_size
-
-        return sections
-
-    def _handle_compression_section(self, buf, sec, sections, depth):
-        """处理压缩 section"""
-        offset = sec['offset']
-        sec_hdr = sec['hdr_size']
-        sec_size = sec['size']
-
-        if sec_hdr + 5 > sec_size:
-            return
-
-        data_off = offset + sec_hdr
-        uncomp_len = struct.unpack_from('<I', buf, data_off)[0]
-        comp_type = buf[data_off + 4]
-
-        compressed_data = buf[data_off + 5:offset + sec_size]
-        prefix = '  ' * depth
-
-        if comp_type == EFI_NOT_COMPRESSED:
-            # 未压缩，直接递归解析
-            inner_start = align_up(data_off + 5, 4)
-            inner_sections = self._parse_sections(buf, inner_start, offset + sec_size, depth + 1)
-            sections.extend(inner_sections)
-
-        elif comp_type == EFI_STANDARD_COMPRESSION:
-            print(f'{prefix}  [LZMA COMPRESSION] compressed={len(compressed_data)} uncomp={uncomp_len}')
-            decompressed = try_lzma_decompress(compressed_data)
-            if decompressed:
-                print(f'{prefix}  [DECOMPRESSED] {len(decompressed)} bytes')
-                # 在解压数据中递归解析 sections
-                inner_sections = self._parse_sections(decompressed, 0, len(decompressed), depth + 1)
-                # 对于解压数据中的 section，需要用解压后的 buffer 提取
-                for isec in inner_sections:
-                    sections.append({**isec, '_buf': decompressed})
-
-                # 也在解压数据中扫描 FV
-                self._scan_and_parse(decompressed, 0, depth + 1)
-            else:
-                print(f'{prefix}  [LZMA DECOMPRESSION FAILED]')
-
-    def _handle_guid_defined_section(self, buf, sec, sections, depth):
-        """处理 GUID-defined section"""
-        offset = sec['offset']
-        sec_hdr = sec['hdr_size']
-        sec_size = sec['size']
-
-        if sec_hdr + 20 > sec_size:
-            return
-
-        data_off = offset + sec_hdr
-        guid = read_guid(buf, data_off)
-        data_offset_field = struct.unpack_from('<H', buf, data_off + 16)[0]
-        attrs = struct.unpack_from('<H', buf, data_off + 18)[0]
-
-        inner_start = offset + data_offset_field
-        inner_data = buf[inner_start:offset + sec_size]
+    def deep_scan(self, data, depth=0):
+        if depth > 5 or not data or len(data) < 0x40: return
+        
+        h = hash(data[:1000])
+        if h in self.scanned_hashes: return
+        self.scanned_hashes.add(h)
 
         prefix = '  ' * depth
-
-        if guid == LZMA_COMPRESS_GUID:
-            print(f'{prefix}  [GUID LZMA] {len(inner_data)} bytes compressed')
-            decompressed = try_lzma_decompress(inner_data)
-            if decompressed:
-                print(f'{prefix}  [DECOMPRESSED] {len(decompressed)} bytes')
-                inner_sections = self._parse_sections(decompressed, 0, len(decompressed), depth + 1)
-                for isec in inner_sections:
-                    sections.append({**isec, '_buf': decompressed})
-                self._scan_and_parse(decompressed, 0, depth + 1)
-            else:
-                print(f'{prefix}  [GUID LZMA DECOMPRESSION FAILED]')
-        else:
-            # 尝试直接解析
-            inner_start_aligned = align_up(inner_start, 4)
-            inner_sections = self._parse_sections(buf, inner_start_aligned, offset + sec_size, depth + 1)
-            sections.extend(inner_sections)
-
-    def _get_ui_name(self, buf, sections):
-        for sec in sections:
-            if sec['type'] == EFI_SECTION_USER_INTERFACE:
-                b = sec.get('_buf', buf)
-                off = sec['offset'] + sec['hdr_size']
-                size = sec['size'] - sec['hdr_size']
+        
+        off = 0
+        while True:
+            off = data.find(PE_MZ_SIGNATURE, off)
+            if off == -1: break
+            if off + 0x40 < len(data):
                 try:
-                    return b[off:off + size].decode('utf-16-le').rstrip('\x00')
-                except (UnicodeDecodeError, ValueError):
-                    pass
-        return None
+                    pe_ptr = struct.unpack_from('<H', data, off + 0x3C)[0]
+                    if data[off + pe_ptr : off + pe_ptr + 2] == b'PE':
+                        info = self.parse_pe_info(data[off:], off)
+                        self.log(f"FOUND PE: Offset 0x{off:X} | {info}", depth)
+                        self.pe_files.append((off, data[off:], info))
+                except: pass
+            off += 2
 
-    def _get_pe32(self, buf, sections):
-        for sec in sections:
-            if sec['type'] in (EFI_SECTION_PE32, EFI_SECTION_TE):
-                b = sec.get('_buf', buf)
-                off = sec['offset'] + sec['hdr_size']
-                size = sec['size'] - sec['hdr_size']
-                return b[off:off + size]
-        return None
+        off = 0
+        while True:
+            off = data.find(BMP_SIGNATURE, off)
+            if off == -1: break
+            if off + 14 < len(data):
+                f_size = struct.unpack_from('<I', data, off + 2)[0]
+                if 100 < f_size < 10 * 1024 * 1024:
+                    self.log(f"FOUND BMP: Offset 0x{off:X} | Size: {f_size} bytes", depth)
+                    self.images.append((off, f_size, data[off:off+f_size]))
+            off += 2
+
+        off = 0
+        while True:
+            off = data.find(b'\x5d\x00\x00', off)
+            if off == -1: break
+            decomp = self.try_lzma_decompress(data[off:off+0x200000])
+            if decomp:
+                print(f"{prefix}[Decompressed Layer {depth+1}] Size: 0x{len(decomp):X}")
+                self.deep_scan(decomp, depth + 1)
+            off += 1
+
+        off = 0
+        while True:
+            off = data.find(EFI_FV_SIGNATURE, off)
+            if off == -1: break
+            fv_start = off - 0x28
+            if fv_start >= 0:
+                try:
+                    fv_len = struct.unpack_from('<Q', data, fv_start + 0x20)[0]
+                    if 0x100 < fv_len < len(data) - fv_start:
+                        self.log(f"Entering Firmware Volume (FV) at 0x{fv_start:X}", depth)
+                        self.deep_scan(data[fv_start : fv_start + fv_len], depth + 1)
+                except: pass
+            off += 4
 
 def main():
-    if len(sys.argv) < 2:
-        print(f'用法: {sys.argv[0]} <abl.img> [output.efi]')
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Advanced QCOM ABL Investigator")
+    parser.add_argument("input", help="Path to ABL.elf/img")
+    parser.add_argument("-o", "--output", default="extracted", help="Output directory (default: extracted)")
+    parser.add_argument("-e", "--extract", choices=["pe32", "bmp", "all"], help="Extract target: pe32, bmp, or all (default: largest PE only)")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Show all scanning details")
+    parser.add_argument("-i", "--info", action="store_true", help="Info mode: List contents without extracting")
+    
+    args = parser.parse_args()
+    if not os.path.exists(args.input):
+        print(f"Error: {args.input} not found."); sys.exit(1)
 
-    abl_path = sys.argv[1]
-    output_path = sys.argv[2] if len(sys.argv) > 2 else 'LinuxLoader.efi'
+    with open(args.input, 'rb') as f: raw_data = f.read()
 
-    if not os.path.isfile(abl_path):
-        print(f'错误: 文件不存在 - {abl_path}')
-        sys.exit(1)
+    print(f"[*] Analyzing {os.path.basename(args.input)} (Size: {len(raw_data)} bytes)")
+    ext = HeavyExtractor(verbose=args.verbose, info_only=args.info)
+    ext.deep_scan(raw_data)
 
-    with open(abl_path, 'rb') as f:
-        data = f.read()
+    if args.info:
+        print("\n--- Scan Summary ---")
+        print(f"Total PE Files Found: {len(ext.pe_files)}")
+        print(f"Total BMP Images Found: {len(ext.images)}")
+        return
 
-    print(f'读取 {abl_path} ...')
-    extractor = EfiExtractor(data)
-    extractor.run()
+    if not os.path.exists(args.output):
+        os.makedirs(args.output)
+        print(f"[*] Created output directory: {args.output}")
 
-    # 查找 LinuxLoader
-    linuxloader = None
-    all_apps = []
+    if ext.pe_files or ext.images:
+        if args.extract is None:
+            ext.pe_files.sort(key=lambda x: len(x[1]), reverse=True)
+            _, loader_data, _ = ext.pe_files[0]
+            try:
+                pe_ptr = struct.unpack_from('<H', loader_data, 0x3C)[0]
+                num_sec = struct.unpack_from('<H', loader_data, pe_ptr + 0x06)[0]
+                opt_size = struct.unpack_from('<H', loader_data, pe_ptr + 0x14)[0]
+                last_sec = pe_ptr + 0x18 + opt_size + (num_sec - 1) * 0x28
+                real_len = struct.unpack_from('<I', loader_data, last_sec + 0x14)[0] + \
+                           struct.unpack_from('<I', loader_data, last_sec + 0x18)[0]
+                final_path = os.path.join(args.output, "LinuxLoader.efi")
+                with open(final_path, 'wb') as f: f.write(loader_data[:real_len])
+                print(f"[+] Extracted LinuxLoader.efi to {final_path}")
+            except:
+                final_path = os.path.join(args.output, "LinuxLoader.efi")
+                with open(final_path, 'wb') as f: f.write(loader_data)
+                print(f"[!] Saved raw PE chunk to {final_path} (trimming failed)")
+        
+        if args.extract in ["pe32", "all"]:
+            for i, (off, data, info) in enumerate(ext.pe_files):
+                try:
+                    pe_ptr = struct.unpack_from('<H', data, 0x3C)[0]
+                    num_sec = struct.unpack_from('<H', data, pe_ptr + 0x06)[0]
+                    opt_size = struct.unpack_from('<H', data, pe_ptr + 0x14)[0]
+                    last_sec = pe_ptr + 0x18 + opt_size + (num_sec - 1) * 0x28
+                    real_len = struct.unpack_from('<I', data, last_sec + 0x14)[0] + \
+                               struct.unpack_from('<I', data, last_sec + 0x18)[0]
+                    pe_slice = data[:real_len]
+                except:
+                    pe_slice = data
+                
+                fname = os.path.join(args.output, f"extracted_{i}.efi")
+                with open(fname, 'wb') as f: f.write(pe_slice)
+                print(f"  -> Extracted PE {i}: {fname}")
 
-    for name, guid, pe_data in extractor.results:
-        all_apps.append((name, guid, pe_data))
-        if name and 'linuxloader' in name.lower():
-            linuxloader = (name, guid, pe_data)
-
-    if linuxloader:
-        name, guid, pe_data = linuxloader
-        with open(output_path, 'wb') as f:
-            f.write(pe_data)
-        print(f'\n成功: {output_path} ({len(pe_data)} bytes)')
-        sys.exit(0)
-
-    if all_apps:
-        print(f'\n未找到 LinuxLoader，导出全部 {len(all_apps)} 个 EFI 文件:')
-        for i, (name, guid, pe_data) in enumerate(all_apps):
-            safe_name = (name or guid).replace('/', '_').replace('\\', '_')
-            out = f'{safe_name}.efi'
-            with open(out, 'wb') as f:
-                f.write(pe_data)
-            print(f'  {out} ({len(pe_data)} bytes)')
-        sys.exit(1)
-
-    print('\n提取失败')
-    sys.exit(1)
+        if args.extract in ["bmp", "all"]:
+            for i, (off, size, data) in enumerate(ext.images):
+                fname = os.path.join(args.output, f"image_0x{off:X}.bmp")
+                with open(fname, 'wb') as f: f.write(data)
+                print(f"  -> Extracted BMP: {fname}")
+    else:
+        print("\n[-] No PE or BMP files found.")
 
 if __name__ == '__main__':
     main()

@@ -84,6 +84,9 @@
   DebugPrintErrorLevelLib|MdeModulePkg/Library/DxeDebugPrintErrorLevelLib/DxeDebugPrintErrorLevelLib.inf
   UefiDriverEntryPoint|MdePkg/Library/UefiDriverEntryPoint/UefiDriverEntryPoint.inf
   PerformanceLib|MdeModulePkg/Library/DxePerformanceLib/DxePerformanceLib.inf
+  BaseMemoryLib|MdePkg/Library/BaseMemoryLib/BaseMemoryLib.inf
+  LzmaDecompressLib|MdeModulePkg/Library/LzmaCustomDecompressLib/LzmaCustomDecompressLib.inf
+
 
 [LibraryClasses.ARM]
   ArmLib|ArmPkg/Library/ArmLib/ArmBaseLib.inf
@@ -111,6 +114,9 @@
   !endif
   !if $(VERIFIED_BOOT_LE)
       GCC:*_*_*_CC_FLAGS = -DVERIFIED_BOOT_LE
+  !endif
+  !if $(TEST_ADAPTER)
+      GCC:*_*_*_CC_FLAGS = -DTEST_ADAPTER
   !endif
   !if $(ROOT_PARTLABEL_SUPPORT)
       GCC:*_*_*_CC_FLAGS = -DROOT_PARTLABEL_SUPPORT
@@ -173,6 +179,12 @@
   !endif
   !if $(ENABLE_LE_VARIANT) == 1
       GCC:*_*_*_CC_FLAGS = -DENABLE_LE_VARIANT
+  !endif
+  !if $(AUTO_PATCH_ABL) == 1
+      GCC:*_*_*_CC_FLAGS = -DAUTO_PATCH_ABL
+  !endif
+    !if $(DISABLE_PRINT) == 1
+      GCC:*_*_*_CC_FLAGS = -DDISABLE_PRINT
   !endif
   !if $(WEAR_OS)
       GCC:*_*_*_CC_FLAGS = -DWEAR_OS

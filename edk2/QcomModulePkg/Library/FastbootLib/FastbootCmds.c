@@ -112,7 +112,6 @@ STATIC struct GetVarPartitionInfo PublishedPartInfo[MAX_NUM_PARTITIONS];
 
 STATIC FASTBOOT_VAR *Varlist;
 STATIC BOOLEAN Finished = FALSE;
-STATIC CHAR8 StrSerialNum[MAX_RSP_SIZE];
 STATIC CHAR8 FullProduct[MAX_RSP_SIZE];
 STATIC CHAR8 StrVariant[MAX_RSP_SIZE];
 STATIC CHAR8 StrSocVersion[MAX_RSP_SIZE];
@@ -3579,11 +3578,6 @@ FastbootCommandSetup (IN VOID *Base, IN UINT64 Size)
   };
 
   /* Register the commands only for non-user builds */
-  Status = BoardSerialNum (StrSerialNum, sizeof (StrSerialNum));
-  if (Status != EFI_SUCCESS) {
-    DEBUG ((EFI_D_ERROR, "Error Finding board serial num: %x\n", Status));
-    return Status;
-  }
   /* Publish getvar variables */
   FastbootPublishVar ("kernel", "uefi");
   AsciiSPrint (MaxDownloadSizeStr,
@@ -3596,7 +3590,6 @@ FastbootCommandSetup (IN VOID *Base, IN UINT64 Size)
 
   AsciiSPrint (FullProduct, sizeof (FullProduct), "%a", PRODUCT_NAME);
   FastbootPublishVar ("product", FullProduct);
-  FastbootPublishVar ("serialno", StrSerialNum);
   FastbootPublishVar ("secure", IsSecureBootEnabled () ? "yes" : "no");
   if (MultiSlotBoot) {
     /*Find ActiveSlot, bydefault _a will be the active slot

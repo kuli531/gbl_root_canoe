@@ -1,18 +1,78 @@
-# gbl_root_canoe
-root 8e5/8g5的设备，同时让系统认为BL锁定
+# build with CLAND/LLD version 20
+# GBL Root Canoe
 
-ABL.efi:不含superfb，建议设备解锁时使用  fastboot由官方提供
+## This Proj is not used to hack inside games or commit a crime, Use at ur OWN RISK ! 
 
-ABL_with_superfastboot.efi:含superfb，建议设备锁定时使用 fastboot由superfb提供
 
-ABL 补丁1：让锁定时跳过错误
-补丁2,强制向tee报告锁定，验证通过
+## What this project is
 
-因为补丁2存在，锁bl非必须，锁的好处是去除解锁提示
+`gbl_root_canoe` is built on EDK2 and includes an exploit lab path for GBL/UEFI secure boot chain manipulation.
 
-HYPER OS等有防回滚的系统不要锁bl，使用ABL.efi
-hyperos 解锁不炸tee，所以这个的用途不大，除了0模块可以隐藏BL状态
+## Why it matters
 
-如果锁bl模式（ABL.efi）
-卸载时非oppo系请使用内建fb解锁
-oppo系使用深度测试官方bl解锁
+- Demonstrates how a vulnerable Qualcomm UEFI chain can be abused by replacing/patching image components.
+- Supports automated extract/modify/rebuild for GBL blobs and ABL payloads.
+- Provides tests for reproducible exploit validation and safe researcher workflows.
+
+## Exploit Influenced Platforms
+
+- Xiaomi 17 series && RedMi K90 ProMax
+- Oneplus 15 && ace 6t
+- Redmagic 11 series
+- Nubia Z80 ultra
+
+*** None Of the Scamsung Phones r influenced ***
+
+## Core directories
+
+- `edk2/`: EDK2 source + Qualcomm platform packages, build scripts.
+- `tools/`: exploit utilities (`extractfv.py`, `patch_abl.c`), patch generator, binary helpers.
+- `images/`: staging inputs/outputs for raw firmware images.
+- `tests/`: validation use cases, end-to-end patch+build checks.
+- `Conf/`: build target rules and patch configuration definitions.
+
+## Quick setup
+
+1. setup environment:
+
+```bash
+cd edk2
+source edksetup.sh
+```
+
+2. install dependencies:
+
+- clang/llvm, lld
+- Python 3
+- make/ninja
+
+3. build baseline firmware:
+
+```bash
+cd edk2
+build -p ArmPlatformPkg/ArmPlatformPkg.dsc -a AARCH64 -b RELEASE
+```
+
+4. run features/tests:
+
+```bash
+cd ../tests
+./runall.sh
+```
+
+## Exploit workflow (Qualcomm UEFI)
+
+1. Extract components from a GBL/UEFI image (`tools/extractfv.py`).
+2. Locate vulnerable module (e.g., ABL path, boot policy handler).
+3. Apply patch model from `tools/patch_abl.c` or `Conf/` rule script.
+4. Repack the image in `images/` and re-sign if needed.
+5. Deploy to lab board and observe root escalation path.
+
+## Notes
+
+- `gbl_root_canoe` is for security research: responsible disclosure and lab-only operations.
+- Keep a clean copy of original image to avoid bricking hardware.
+
+## License
+
+See `LICENSE` and `edk2/License.txt` for terms. Qualcomm exploit code examples are for research and may require compliance with local law.
